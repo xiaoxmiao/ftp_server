@@ -7,9 +7,48 @@ import ctypes.wintypes
 import ipaddress
 import socket
 import subprocess
+import logging
+from logging.handlers import TimedRotatingFileHandler
 from pyftpdlib.authorizers import DummyAuthorizer, AuthenticationFailed
 from pyftpdlib.handlers import FTPHandler
 from pyftpdlib.servers import FTPServer
+
+log = logging.getLogger("ftp_server")
+
+def setup_logging():
+    base = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(base, "log")
+    os.makedirs(log_dir, exist_ok=True)
+
+    log.setLevel(logging.INFO)
+
+    def namer(name):
+        import re
+        m = re.search(r"\.(\d{4}-\d{2}-\d{2})$", name)
+        if m:
+            return os.path.join(os.path.dirname(name), f"{m.group(1)}.log")
+        return name
+
+    fh = TimedRotatingFileHandler(
+        os.path.join(log_dir, "ftp-server.log"),
+        when="midnight", interval=1, encoding="utf-8", backupCount=90
+    )
+    fh.namer = namer
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(fh)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("%(message)s"))
+    log.addHandler(ch)
+
+    for logger_name in ["pyftpdlib", "pyftpdlib.log", "pyftpdlib.ioloop"]:
+        l = logging.getLogger(logger_name)
+        l.setLevel(logging.INFO)
+        l.handlers.clear()
+        l.addHandler(fh)
+        l.addHandler(ch)
 
 class SmartFTPHandler(FTPHandler):
     # 内网网络范围（写死）
@@ -47,7 +86,7 @@ class SmartFTPHandler(FTPHandler):
         
         # 如果客户端IP是路由器IP，说明是内网客户端通过外网域名访问
         if type(self).router_ip and self.remote_ip == type(self).router_ip:
-            print(f"[Connect] 内网客户端通过外网访问 (来自路由器 {self.remote_ip}) -> 使用 masquerade: {type(self).masquerade_address}")
+            log.info(f"[Connect] 内网客户端通过外网访问 (来自路由器 {self.remote_ip}) -> 使用 masquerade: {type(self).masquerade_address}")
             return
         
         # 检查客户端是否来自本地私网
@@ -56,10 +95,10 @@ class SmartFTPHandler(FTPHandler):
         if client_is_private:
             # 直接从内网连接 → 使用本地IP
             self.masquerade_address = None
-            print(f"[Connect] 内网客户端 {self.remote_ip} -> 使用本地 IP")
+            log.info(f"[Connect] 内网客户端 {self.remote_ip} -> 使用本地 IP")
         else:
             # 外网客户端 → 使用masquerade
-            print(f"[Connect] 外网客户端 {self.remote_ip} -> 使用 masquerade: {type(self).masquerade_address}")
+            log.info(f"[Connect] 外网客户端 {self.remote_ip} -> 使用 masquerade: {type(self).masquerade_address}")
 
 advapi32 = ctypes.windll.advapi32
 kernel32 = ctypes.windll.kernel32
@@ -104,7 +143,7 @@ def get_router_ip_upnp():
             if host and host.count('.') == 3:
                 try:
                     ipaddress.ip_address(host)
-                    print(f"Router IP (UPnP): {host}")
+                    log.info(f"Router IP (UPnP): {host}")
                     return host
                 except ValueError:
                     pass
@@ -126,12 +165,12 @@ def get_router_ip_windows():
                     gateway = parts[2]
                     try:
                         ipaddress.ip_address(gateway)
-                        print(f"Router IP: {gateway}")
+                        log.info(f"Router IP: {gateway}")
                         return gateway
                     except ValueError:
                         continue
     except Exception as e:
-        print(f"Router IP detection failed: {e}")
+        log.error(f"Router IP detection failed: {e}")
     return None
 
 def get_router_ip(cfg):
@@ -143,7 +182,7 @@ def get_router_ip(cfg):
     """
     # 检查配置文件
     if cfg.get("router_ip"):
-        print(f"使用配置文件中的路由器IP: {cfg['router_ip']}")
+        log.info(f"使用配置文件中的路由器IP: {cfg['router_ip']}")
         return cfg["router_ip"]
     
     router_ip = get_router_ip_upnp()
@@ -154,7 +193,7 @@ def get_router_ip(cfg):
     if router_ip:
         return router_ip
     
-    print("警告: 无法获取路由器IP")
+    log.warning("无法获取路由器IP")
     return None
 
 def get_local_ip():
@@ -175,7 +214,7 @@ def setup_upnp_ports(cfg):
     try:
         import miniupnpc
     except ImportError:
-        print("UPnP: miniupnpc not available")
+        log.warning("UPnP: miniupnpc not available")
         return None
 
     try:
@@ -183,36 +222,36 @@ def setup_upnp_ports(cfg):
         u.discoverdelay = 200
         nd = u.discover()
         if nd == 0:
-            print("UPnP: no gateway found")
+            log.warning("UPnP: no gateway found")
             return None
-        print(f"UPnP: {nd} gateway(s) found")
+        log.info(f"UPnP: {nd} gateway(s) found")
         u.selectigd()
-        print(f"UPnP: local IP: {u.lanaddr}")
+        log.info(f"UPnP: local IP: {u.lanaddr}")
     except Exception as e:
-        print(f"UPnP discovery failed: {e}")
+        log.error(f"UPnP discovery failed: {e}")
         return None
 
     ip = u.externalipaddress()
     if ip:
         SmartFTPHandler.masquerade_address = ip
-        print(f"External IP (UPnP): {ip}")
+        log.info(f"External IP (UPnP): {ip}")
     else:
-        print("UPnP: could not get external IP")
+        log.warning("UPnP: could not get external IP")
 
     local_ip = u.lanaddr
     if not local_ip or local_ip == "0.0.0.0":
         local_ip = get_local_ip()
         if local_ip:
-            print(f"UPnP: using local IP from socket: {local_ip}")
+            log.info(f"UPnP: using local IP from socket: {local_ip}")
 
     ok = True
 
     control_port = cfg.get("port", 21)
     try:
         u.addportmapping(control_port, 'TCP', local_ip, control_port, 'FTP Control', '')
-        print(f"UPnP mapped: port {control_port} TCP")
+        log.info(f"UPnP mapped: port {control_port} TCP")
     except Exception as e:
-        print(f"UPnP failed to map port {control_port}: {e}")
+        log.error(f"UPnP failed to map port {control_port}: {e}")
         ok = False
 
     passive_ports = cfg.get("passive_ports", [50000, 50010])
@@ -222,9 +261,9 @@ def setup_upnp_ports(cfg):
             u.addportmapping(port, 'TCP', local_ip, port, 'FTP Passive', '')
             mapped += 1
         except Exception as e:
-            print(f"UPnP failed to map port {port}: {e}")
+            log.error(f"UPnP failed to map port {port}: {e}")
     if mapped > 0:
-        print(f"UPnP mapped: {mapped}/{passive_ports[1] - passive_ports[0] + 1} passive ports")
+        log.info(f"UPnP mapped: {mapped}/{passive_ports[1] - passive_ports[0] + 1} passive ports")
         ok = True
 
     return u
@@ -244,9 +283,9 @@ def remove_upnp_mappings(u, cfg):
                 u.deleteportmapping(port, 'TCP')
             except Exception:
                 pass
-        print("UPnP: port mappings removed")
+        log.info("UPnP: port mappings removed")
     except Exception as e:
-        print(f"UPnP cleanup failed: {e}")
+        log.warning(f"UPnP cleanup failed: {e}")
 
 class WindowsAuthorizer(DummyAuthorizer):
     def __init__(self, cfg):
@@ -315,8 +354,8 @@ def load_config():
     if not os.path.exists(path):
         path = os.path.join(os.path.dirname(sys.executable), "config.json")
     if not os.path.exists(path):
-        print(f"Config file not found: {path}")
-        print("Copy config.example.json to config.json and edit it.")
+        log.error(f"Config file not found: {path}")
+        log.error("Copy config.example.json to config.json and edit it.")
         sys.exit(1)
     with open(path, encoding="utf-8-sig") as f:
         return json.load(f)
@@ -327,7 +366,7 @@ def external_ip_updater(cfg, stop_event):
         ip = get_external_ip_upnp()
         if ip and ip != SmartFTPHandler.masquerade_address:
             SmartFTPHandler.masquerade_address = ip
-            print(f"External IP updated: {ip}")
+            log.info(f"External IP updated: {ip}")
 
 def create_server():
     cfg = load_config()
@@ -343,7 +382,7 @@ def create_server():
 
     # 获取本机 IP
     SmartFTPHandler.local_ip = get_local_ip()
-    print(f"Local IP: {SmartFTPHandler.local_ip}")
+    log.info(f"Local IP: {SmartFTPHandler.local_ip}")
     
     # 获取路由器 IP
     SmartFTPHandler.router_ip = get_router_ip(cfg)
@@ -360,6 +399,7 @@ def create_server():
     return cfg, FTPServer((host, port), SmartFTPHandler)
 
 def main():
+    setup_logging()
     cfg, server = create_server()
     upnp_obj = None
     ext_ip_cfg = cfg.get("external_ip", {})
@@ -369,19 +409,19 @@ def main():
         if not upnp_obj and not SmartFTPHandler.masquerade_address:
             SmartFTPHandler.masquerade_address = cfg.get("masquerade_address")
 
-    print(f"FTP Server started on {cfg['host']}:{cfg['port']}")
+    log.info(f"FTP Server started on {cfg['host']}:{cfg['port']}")
     ports = cfg.get("passive_ports", [50000, 50010])
-    print(f"Passive ports: {ports[0]}-{ports[1]}")
-    print(f"External IP: {SmartFTPHandler.masquerade_address or '(not set)'}")
-    print(f"Router IP: {SmartFTPHandler.router_ip or '(not detected)'}")
+    log.info(f"Passive ports: {ports[0]}-{ports[1]}")
+    log.info(f"External IP: {SmartFTPHandler.masquerade_address or '(not set)'}")
+    log.info(f"Router IP: {SmartFTPHandler.router_ip or '(not detected)'}")
     if ext_ip_cfg.get("upnp", False):
-        print(f"UPnP external IP check enabled (interval: {ext_ip_cfg.get('check_interval', 60)}s)")
-        print("UPnP port mapping active")
+        log.info(f"UPnP external IP check enabled (interval: {ext_ip_cfg.get('check_interval', 60)}s)")
+        log.info("UPnP port mapping active")
     if cfg.get("anonymous", {}).get("enabled", True):
-        print(f"Anonymous: read-only access (home: {cfg['anonymous'].get('home_dir', '.')})")
+        log.info(f"Anonymous: read-only access (home: {cfg['anonymous'].get('home_dir', '.')})")
     if cfg.get("windows_auth", {}).get("enabled", True):
-        print("Windows users: full access")
-    print("Press Ctrl+C to stop")
+        log.info("Windows users: full access")
+    log.info("Press Ctrl+C to stop")
 
     stop_event = threading.Event()
     if ext_ip_cfg.get("upnp", False):
@@ -392,7 +432,7 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         stop_event.set()
-        print("\nServer stopped.")
+        log.info("\nServer stopped.")
     finally:
         remove_upnp_mappings(upnp_obj, cfg)
 
