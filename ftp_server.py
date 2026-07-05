@@ -91,6 +91,27 @@ def get_external_ip_upnp():
     except Exception:
         return None
 
+def get_router_ip_upnp():
+    try:
+        import miniupnpc
+        from urllib.parse import urlparse
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 200
+        u.discover()
+        u.selectigd()
+        if u.controlurl:
+            host = urlparse(u.controlurl).hostname
+            if host and host.count('.') == 3:
+                try:
+                    ipaddress.ip_address(host)
+                    print(f"Router IP (UPnP): {host}")
+                    return host
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return None
+
 def get_router_ip_windows():
     """通过 route print 获取默认网关"""
     try:
@@ -125,7 +146,10 @@ def get_router_ip(cfg):
         print(f"使用配置文件中的路由器IP: {cfg['router_ip']}")
         return cfg["router_ip"]
     
-    # 尝试 Windows ipconfig（或 route print 获取默认网关）
+    router_ip = get_router_ip_upnp()
+    if router_ip:
+        return router_ip
+
     router_ip = get_router_ip_windows()
     if router_ip:
         return router_ip
