@@ -122,7 +122,19 @@ class SmartFTPHandler(FTPHandler):
         if self._closed:
             return
         self._last_response = ""
-        method = getattr(self, "ftp_" + cmd.replace(" ", "_"))
+
+        # Bug1 fix: 未知命令返回 500 而非崩溃
+        method = getattr(self, "ftp_" + cmd.replace(" ", "_"), None)
+        if method is None:
+            self.respond("500 Unknown command %r." % cmd)
+            return
+
+        # Bug2 fix: 未认证时拒绝需要登录的命令
+        if not self.authenticated:
+            cmd_info = self.proto_cmds.get(cmd)
+            if cmd_info and cmd_info.get("auth"):
+                self.respond("530 Log in with USER and PASS first.")
+                return
 
         authz = self.authorizer
         impersonated = False
@@ -142,10 +154,15 @@ class SmartFTPHandler(FTPHandler):
             if impersonated:
                 authz.terminate_impersonation(self.username)
 
+        # Bug3 fix: 无参命令不再因 args[0] 崩溃
         if self._last_response:
-            code = int(self._last_response[:3])
-            resp = self._last_response[4:]
-            self.log_cmd(cmd, args[0], code, resp)
+            try:
+                code = int(self._last_response[:3])
+                resp = self._last_response[4:]
+                arg = args[0] if args else ""
+                self.log_cmd(cmd, arg, code, resp)
+            except (ValueError, IndexError):
+                pass
 
     def run_as_current_user(self, function, *args, **kwargs):
         """由 process_command 统一管理模拟，这里直接执行即可。"""
@@ -558,11 +575,20 @@ def load_config():
 
 def external_ip_updater(cfg, stop_event):
     interval = cfg.get("external_ip", {}).get("check_interval", 60)
+    upnp_was_down = False
     while not stop_event.wait(interval):
         ip = get_external_ip_upnp()
-        if ip and ip != SmartFTPHandler.masquerade_address:
-            SmartFTPHandler.masquerade_address = ip
-            log.info(f"External IP updated: {ip}")
+        if not ip:
+            upnp_was_down = True
+            continue
+        ip_changed = (ip != SmartFTPHandler.masquerade_address)
+        if ip_changed or upnp_was_down:
+            if ip_changed:
+                log.info(f"External IP changed: {SmartFTPHandler.masquerade_address} -> {ip}")
+            else:
+                log.info(f"UPnP gateway recovered, re-establishing port mappings")
+            setup_upnp_ports(cfg)
+            upnp_was_down = False
 
 def create_server():
     cfg = load_config()
